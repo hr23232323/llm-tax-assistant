@@ -1,0 +1,24 @@
+{
+  "name": "tax-gpt",
+  "version": "2.0.0",
+  "description": "Lean tax assistant powered by IRS Publication 17",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "tax-gpt": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ansi-escapes": "^7.3.0",
+    "boxen": "^8.0.1",
+    "chalk": "^5.6.2",
+    "cli-cursor": "^5.0.0",
+    "dotenv": "^16.4.7",
+    "gradient-string": "^3.0.0",
+    "inquirer": "^13.2.2",
+    "openai": "^4.77.0",
+    "ora": "^9.3.0"
+  }
+}

@@ -1,0 +1,653 @@
+#!/usr/bin/env node
+
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import os from 'os';
+import OpenAI from 'openai';
+import dotenv from 'dotenv';
+import chalk from 'chalk';
+import ora from 'ora';
+import inquirer from 'inquirer';
+import gradient from 'gradient-string';
+import cliCursor from 'cli-cursor';
+import boxen from 'boxen';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config();
+
+const openai = new OpenAI({
+  baseURL: 'https://openrouter.ai/api/v1',
+  apiKey: process.env.OPENROUTER_API_KEY,
+  defaultHeaders: {
+    'HTTP-Referer': 'https://github.com/tax-gpt',
+    'X-Title': 'Tax GPT'
+  }
+});
+
+const MODEL = 'google/gemini-3-flash-preview';
+const MAX_CONTEXT_CHARS = 120000;
+const MAX_HISTORY_TURNS = 10;
+const STREAM_DELAY = 8;
+
+const CONFIG_DIR = path.join(os.homedir(), '.tax-gpt');
+const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions');
+
+const C = {
+  user: chalk.hex('#FF9500'),
+  agent: chalk.hex('#FFFFFF'),
+  agentLabel: chalk.hex('#007AFF'),
+  system: chalk.hex('#8E8E93'),
+  dim: chalk.hex('#636366'),
+  border: chalk.hex('#48484A'),
+  highlight: chalk.hex('#34C759'),
+  error: chalk.hex('#FF3B30'),
+  warning: chalk.hex('#FFCC00'),
+};
+
+const ICONS = {
+  user: '❯',
+  agent: '●',
+  system: '•',
+  arrow: '→',
+  check: '✓',
+  dot: '·'
+};
+
+// Format a single line with color highlights
+function formatLine(text) {
+  // Highlight dollar amounts: $X,XXX
+  text = text.replace(/(\$[\d,]+)/g, C.highlight('$1'));
+  
+  // Highlight percentages: X%
+  text = text.replace(/(\d+%)/g, C.highlight('$1'));
+  
+  // Convert **text** to bold
+  text = text.replace(/\*\*(.+?)\*\*/g, (_, p1) => chalk.bold(p1));
+  
+  // Convert _text_ to italic
+  text = text.replace(/_(.+?)_/g, (_, p1) => chalk.italic(p1));
+  
+  // Convert * bullet to proper bullet
+  text = text.replace(/^\*\s/, C.dim('• ') + ' ');
+  
+  return text;
+}
+
+class SessionManager {
+  constructor() {
+    this.currentSession = null;
+    this.sessions = [];
+  }
+
+  async init() {
+    await fs.mkdir(CONFIG_DIR, { recursive: true });
+    await fs.mkdir(SESSIONS_DIR, { recursive: true });
+    await this.loadSessionsList();
+  }
+
+  async loadSessionsList() {
+    try {
+      const files = await fs.readdir(SESSIONS_DIR);
+      this.sessions = files
+        .filter(f => f.endsWith('.json'))
+        .map(f => f.replace('.json', ''))
+        .sort((a, b) => b.localeCompare(a));
+    } catch {
+      this.sessions = [];
+    }
+  }
+
+  async createSession(name = null) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const sessionName = name || `session-${timestamp}`;
+    
+    this.currentSession = {
+      id: sessionName,
+      name: sessionName,
+      createdAt: new Date().toISOString(),
+      messages: [],
+      metadata: { model: MODEL, totalTurns: 0 }
+    };
+    
+    await this.saveSession();
+    return this.currentSession;
+  }
+
+  async loadSession(sessionId) {
+    try {
+      const data = await fs.readFile(path.join(SESSIONS_DIR, `${sessionId}.json`), 'utf-8');
+      this.currentSession = JSON.parse(data);
+      return this.currentSession;
+    } catch {
+      return null;
+    }
+  }
+
+  async saveSession() {
+    if (!this.currentSession) return;
+    await fs.writeFile(
+      path.join(SESSIONS_DIR, `${this.currentSession.id}.json`),
+      JSON.stringify(this.currentSession, null, 2)
+    );
+  }
+
+  async deleteSession(sessionId) {
+    try {
+      await fs.unlink(path.join(SESSIONS_DIR, `${sessionId}.json`));
+      await this.loadSessionsList();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  addMessage(role, content) {
+    if (!this.currentSession) return;
+    this.currentSession.messages.push({ role, content, timestamp: new Date().toISOString() });
+    this.currentSession.metadata.totalTurns = this.currentSession.messages.filter(m => m.role === 'user').length;
+    if (this.currentSession.messages.length > MAX_HISTORY_TURNS * 2) {
+      this.currentSession.messages = this.currentSession.messages.slice(-MAX_HISTORY_TURNS * 2);
+    }
+    this.saveSession();
+  }
+
+  getRecentMessages(count = 5) {
+    if (!this.currentSession) return [];
+    return this.currentSession.messages.slice(-count * 2);
+  }
+}
+
+class TaxGPT {
+  constructor() {
+    this.knowledgeBase = '';
+    this.chunks = [];
+    this.sessionManager = new SessionManager();
+    this.lineWidth = process.stdout.columns || 80;
+  }
+
+  async loadKnowledgeBase() {
+    const spinner = ora({
+      text: C.system('Loading IRS Publication 17...'),
+      spinner: 'dots',
+      color: 'gray'
+    }).start();
+    
+    try {
+      const kbPath = path.join(__dirname, 'tax-knowledge-base.txt');
+      this.knowledgeBase = await fs.readFile(kbPath, 'utf-8');
+      this.chunks = this.createChunks(this.knowledgeBase, 3000);
+      spinner.succeed(C.system(`Loaded ${this.chunks.length.toLocaleString()} chunks`));
+    } catch (error) {
+      spinner.fail(C.error('Failed to load knowledge base'));
+      throw error;
+    }
+  }
+
+  createChunks(text, chunkSize) {
+    const chunks = [];
+    const paragraphs = text.split('\n\n');
+    let currentChunk = '';
+    
+    for (const para of paragraphs) {
+      if (currentChunk.length + para.length > chunkSize && currentChunk.length > 0) {
+        chunks.push(currentChunk.trim());
+        currentChunk = para;
+      } else {
+        currentChunk += '\n\n' + para;
+      }
+    }
+    if (currentChunk.trim()) chunks.push(currentChunk.trim());
+    return chunks;
+  }
+
+  findRelevantChunks(query, maxChunks = 5) {
+    const queryLower = query.toLowerCase();
+    const keywords = queryLower.split(/\s+/).filter(w => w.length > 3);
+    
+    const scored = this.chunks.map((chunk, idx) => {
+      const chunkLower = chunk.toLowerCase();
+      let score = 0;
+      if (chunkLower.includes(queryLower)) score += 10;
+      for (const kw of keywords) {
+        if (chunkLower.includes(kw)) score += 2;
+      }
+      if (chunk.includes('Table') || chunk.includes('$')) score += 1;
+      return { chunk, score, idx };
+    });
+    
+    return scored
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxChunks)
+      .map(item => item.chunk);
+  }
+
+  buildSystemPrompt(context, history) {
+    return `You are Tax GPT, a tax assistant using IRS Publication 17 (2025).
+
+RULES:
+- Answer using ONLY the IRS Publication 17 context provided
+- Be concise. Prefer one sentence over two
+- Use bullet points for lists
+- Cite specific tables, sections, or page numbers
+- Ask clarifying questions when tax situation is unclear
+- Format: $X,XXX for money, percentages as X%
+
+IRS PUBLICATION 17 (2025) CONTEXT:
+${context}
+
+${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
+  }
+
+  async askQuestion(question) {
+    const relevantChunks = this.findRelevantChunks(question);
+    const context = relevantChunks.join('\n---\n');
+    const truncatedContext = context.length > MAX_CONTEXT_CHARS 
+      ? context.substring(0, MAX_CONTEXT_CHARS) + '...'
+      : context;
+
+    const recentHistory = this.sessionManager.getRecentMessages(3);
+    const historyContext = recentHistory.length > 0 
+      ? recentHistory.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.substring(0, 100)}${m.content.length > 100 ? '...' : ''}`).join('\n')
+      : '';
+
+    const messages = [
+      {
+        role: 'system',
+        content: this.buildSystemPrompt(truncatedContext, historyContext)
+      },
+      ...recentHistory.map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: question }
+    ];
+
+    try {
+      const completion = await openai.chat.completions.create({
+        model: MODEL,
+        messages: messages,
+        temperature: 0.2,
+        max_tokens: 1500,
+        stream: true
+      });
+
+      return completion;
+    } catch (error) {
+      if (error.status === 401) {
+        throw new Error('Invalid API key. Check OPENROUTER_API_KEY in .env');
+      }
+      throw error;
+    }
+  }
+
+  async streamResponse(stream) {
+    cliCursor.hide();
+    
+    // Print agent label
+    process.stdout.write('\n' + C.agentLabel('  ' + ICONS.agent + ' Tax GPT\n'));
+    process.stdout.write(C.agent('  '));
+    
+    let fullContent = '';
+    let currentLineLength = 2;
+    const maxWidth = Math.min(this.lineWidth - 4, 100);
+    
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content || '';
+      if (content) {
+        fullContent += content;
+        
+        // Simple word streaming without markdown processing
+        const words = content.split(/(\s+)/);
+        
+        for (const word of words) {
+          if (word.includes('\n')) {
+            const parts = word.split('\n');
+            parts.forEach((part, idx) => {
+              if (idx === 0) {
+                process.stdout.write(C.agent(part));
+                currentLineLength += part.length;
+              } else {
+                process.stdout.write('\n  ');
+                process.stdout.write(C.agent(part));
+                currentLineLength = 2 + part.length;
+              }
+            });
+          } else {
+            if (currentLineLength + word.length > maxWidth && word.trim()) {
+              process.stdout.write('\n  ');
+              currentLineLength = 2;
+            }
+            
+            process.stdout.write(C.agent(word));
+            currentLineLength += word.length;
+          }
+          
+          if (STREAM_DELAY > 0) {
+            await new Promise(r => setTimeout(r, STREAM_DELAY));
+          }
+        }
+      }
+    }
+    
+    process.stdout.write('\n');
+    cliCursor.show();
+    
+    return fullContent;
+  }
+
+  printWelcome() {
+    console.log('\n');
+    console.log(gradient(['#007AFF', '#00C7BE'])(
+      '  ╔══════════════════════════════════════════════════════════╗'
+    ));
+    console.log(gradient(['#007AFF', '#00C7BE'])(
+      '  ║                                                          ║'
+    ));
+    console.log(gradient(['#007AFF', '#00C7BE'])(
+      '  ║              Tax GPT  ·  Tax Assistant                   ║'
+    ));
+    console.log(gradient(['#007AFF', '#00C7BE'])(
+      '  ║                                                          ║'
+    ));
+    console.log(gradient(['#007AFF', '#00C7BE'])(
+      '  ╚══════════════════════════════════════════════════════════╝'
+    ));
+    console.log('\n');
+    console.log(C.dim('  IRS Publication 17 (2025)  ·  Gemini 3 Flash  ·  /help'));
+    console.log('');
+  }
+
+  printUserMessage(text) {
+    console.log(C.user('  ' + ICONS.user + ' ' + text));
+  }
+
+  printError(message) {
+    console.log('');
+    console.log(C.error('  ' + ICONS.dot + ' ' + message));
+    console.log('');
+  }
+
+  printSystem(message) {
+    console.log(C.system('  ' + ICONS.system + ' ' + message));
+  }
+
+  printInputBox() {
+    const width = Math.min(process.stdout.columns - 4, 76);
+    const line = '─'.repeat(width);
+    console.log(C.dim('  ' + line));
+  }
+
+  async handleCommand(input) {
+    const command = input.trim().toLowerCase();
+
+    switch (command) {
+      case '/help':
+        console.log('');
+        console.log(boxen(
+          C.agentLabel('Commands') + '\n\n' +
+          C.highlight('/new') + '      Start new session\n' +
+          C.highlight('/sessions') + ' List all sessions\n' +
+          C.highlight('/switch') + '   Switch to another session\n' +
+          C.highlight('/clear') + '    Clear current history\n' +
+          C.highlight('/history') + '  Show recent messages\n' +
+          C.highlight('/export') + '   Export to markdown\n' +
+          C.highlight('/delete') + '   Delete a session\n' +
+          C.highlight('/quit') + '     Exit',
+          { padding: 1, margin: 1, borderStyle: 'round', borderColor: '#48484A' }
+        ));
+        return true;
+
+      case '/quit':
+      case '/exit':
+        console.log('');
+        this.printSystem('Saving session...');
+        await this.sessionManager.saveSession();
+        console.log('');
+        process.exit(0);
+
+      case '/new':
+        const { sessionName } = await inquirer.prompt([{
+          type: 'input',
+          name: 'sessionName',
+          message: C.system('Session name (optional):'),
+          default: ''
+        }]);
+        await this.sessionManager.createSession(sessionName || null);
+        console.log('');
+        this.printSystem(`New session: ${this.sessionManager.currentSession.name}`);
+        console.log('');
+        return true;
+
+      case '/sessions':
+        await this.sessionManager.loadSessionsList();
+        if (this.sessionManager.sessions.length === 0) {
+          this.printSystem('No saved sessions');
+          console.log('');
+          return true;
+        }
+        
+        console.log('');
+        console.log(C.agentLabel('  Sessions:'));
+        console.log(C.dim('  ' + '─'.repeat(40)));
+        this.sessionManager.sessions.forEach((id) => {
+          const isCurrent = id === this.sessionManager.currentSession?.id;
+          const prefix = isCurrent ? C.highlight(ICONS.check + ' ') : '  ';
+          console.log(prefix + (isCurrent ? chalk.white(id) : C.dim(id)));
+        });
+        console.log('');
+        return true;
+
+      case '/switch':
+        await this.sessionManager.loadSessionsList();
+        if (this.sessionManager.sessions.length === 0) {
+          this.printSystem('No sessions to switch to');
+          console.log('');
+          return true;
+        }
+        
+        const { selected } = await inquirer.prompt([{
+          type: 'list',
+          name: 'selected',
+          message: C.system('Select session:'),
+          choices: this.sessionManager.sessions
+            .filter(id => id !== this.sessionManager.currentSession?.id)
+            .map(id => ({ name: id, value: id }))
+        }]);
+        
+        await this.sessionManager.loadSession(selected);
+        console.log('');
+        this.printSystem(`Switched to: ${selected}`);
+        console.log('');
+        return true;
+
+      case '/clear':
+        if (this.sessionManager.currentSession) {
+          this.sessionManager.currentSession.messages = [];
+          await this.sessionManager.saveSession();
+          this.printSystem('History cleared');
+          console.log('');
+        }
+        return true;
+
+      case '/history':
+        if (!this.sessionManager.currentSession?.messages.length) {
+          this.printSystem('No history in current session');
+          console.log('');
+          return true;
+        }
+        
+        console.log('');
+        console.log(C.agentLabel('  History:'));
+        console.log(C.dim('  ' + '─'.repeat(40)));
+        this.sessionManager.currentSession.messages.forEach(m => {
+          const icon = m.role === 'user' ? C.user(ICONS.user) : C.agentLabel(ICONS.agent);
+          const preview = m.content.substring(0, 60) + (m.content.length > 60 ? '...' : '');
+          console.log(`  ${icon} ${C.dim(preview)}`);
+        });
+        console.log('');
+        return true;
+
+      case '/export':
+        if (!this.sessionManager.currentSession) {
+          this.printError('No active session');
+          return true;
+        }
+        const exportPath = path.join(process.cwd(), `${this.sessionManager.currentSession.id}.md`);
+        const exportContent = `# ${this.sessionManager.currentSession.name}\n\n` +
+          this.sessionManager.currentSession.messages
+            .map(m => `## ${m.role === 'user' ? 'Q' : 'A'}\n\n${m.content}\n`)
+            .join('\n---\n\n');
+        await fs.writeFile(exportPath, exportContent);
+        console.log('');
+        this.printSystem(`Exported: ${exportPath}`);
+        console.log('');
+        return true;
+
+      case '/delete':
+        await this.sessionManager.loadSessionsList();
+        const deletable = this.sessionManager.sessions.filter(id => id !== this.sessionManager.currentSession?.id);
+        if (deletable.length === 0) {
+          this.printSystem('No other sessions to delete');
+          console.log('');
+          return true;
+        }
+        
+        const { toDelete } = await inquirer.prompt([{
+          type: 'list',
+          name: 'toDelete',
+          message: C.system('Delete session:'),
+          choices: deletable.map(id => ({ name: id, value: id }))
+        }]);
+        
+        await this.sessionManager.deleteSession(toDelete);
+        this.printSystem(`Deleted: ${toDelete}`);
+        console.log('');
+        return true;
+
+      default:
+        if (command.startsWith('/')) {
+          this.printError(`Unknown command: ${command}`);
+          this.printSystem('Type /help for commands');
+          console.log('');
+          return true;
+        }
+        return false;
+    }
+  }
+
+  async interactiveMode() {
+    this.printWelcome();
+    await this.sessionManager.init();
+
+    if (!this.sessionManager.currentSession) {
+      await this.sessionManager.createSession();
+    }
+
+    this.printSystem(`Session: ${this.sessionManager.currentSession.name}`);
+    console.log('');
+
+    while (true) {
+      this.printInputBox();
+      
+      const { input } = await inquirer.prompt([{
+        type: 'input',
+        name: 'input',
+        message: '',
+        prefix: C.user('  ' + ICONS.user + ' ')
+      }]);
+
+      if (!input.trim()) continue;
+
+      if (input.startsWith('/')) {
+        await this.handleCommand(input);
+        continue;
+      }
+      
+      // User message already shown in input, just add spacing
+      console.log('');
+
+      const spinner = ora({
+        text: C.dim('Searching...'),
+        spinner: 'dots',
+        color: 'gray'
+      }).start();
+
+      try {
+        this.sessionManager.addMessage('user', input);
+        
+        spinner.text = C.dim('Analyzing...');
+        const stream = await this.askQuestion(input);
+        
+        spinner.stop();
+        
+        // Stream response with color highlighting
+        cliCursor.hide();
+        process.stdout.write('\n' + C.agentLabel('  ' + ICONS.agent + ' Tax GPT') + '\n');
+        
+        let fullContent = '';
+        let currentLine = '';
+        
+        for await (const chunk of stream) {
+          const content = chunk.choices[0]?.delta?.content || '';
+          if (content) {
+            fullContent += content;
+            
+            // Process content word by word for color highlighting
+            const tokens = content.split(/(\s+)/);
+            
+            for (const token of tokens) {
+              if (token.includes('\n')) {
+                // Handle newlines
+                const parts = token.split('\n');
+                parts.forEach((part, idx) => {
+                  if (idx === 0) {
+                    currentLine += part;
+                  } else {
+                    // Print completed line
+                    process.stdout.write(C.agent('  ') + formatLine(currentLine) + '\n');
+                    currentLine = part;
+                  }
+                });
+              } else {
+                currentLine += token;
+              }
+            }
+            
+            await new Promise(r => setTimeout(r, 4));
+          }
+        }
+        
+        // Print final line
+        if (currentLine) {
+          process.stdout.write(C.agent('  ') + formatLine(currentLine) + '\n');
+        }
+        
+        cliCursor.show();
+        this.sessionManager.addMessage('assistant', fullContent);
+        
+        console.log('');
+        console.log(C.dim('  ' + ICONS.dot + ' ' + chalk.italic('Not professional tax advice')));
+        console.log('');
+      } catch (error) {
+        spinner.stop();
+        this.printError(error.message);
+      }
+    }
+  }
+}
+
+async function main() {
+  if (!process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY === 'your_openrouter_api_key_here') {
+    console.error('');
+    console.error(C.error('  Error: OPENROUTER_API_KEY not set'));
+    console.error('');
+    console.error(C.dim('  1. Copy .env.example to .env'));
+    console.error(C.dim('  2. Add your API key from https://openrouter.ai/keys'));
+    console.error('');
+    process.exit(1);
+  }
+
+  const taxGPT = new TaxGPT();
+  await taxGPT.loadKnowledgeBase();
+  await taxGPT.interactiveMode();
+}
+
+main().catch(console.error);
