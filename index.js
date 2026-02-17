@@ -561,7 +561,7 @@ ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
 
   async safePrompt(questions) {
     try {
-      return await this.safePrompt(questions);
+      return await inquirer.prompt(questions);
     } catch (error) {
       if (error.name === 'ExitPromptError') {
         // User pressed Ctrl+C - exit gracefully
