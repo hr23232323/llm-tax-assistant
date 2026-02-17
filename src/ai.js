@@ -10,7 +10,7 @@ import chalk from 'chalk';
 import dotenv from 'dotenv';
 
 import { C, ICONS, MODEL, MAX_CONTEXT_CHARS } from './config.js';
-import { formatLine } from './formatter.js';
+import { formatLine, renderMarkdown } from './formatter.js';
 import { SessionManager } from './session.js';
 import { CommandHandler } from './commands.js';
 
@@ -237,40 +237,53 @@ ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
     process.stdout.write('\n' + C.agentLabel('  ' + ICONS.agent + ' Tax GPT') + '\n');
     
     let fullContent = '';
+    const lines = [];
     let currentLine = '';
     
+    // Collect and display content during streaming
     for await (const chunk of stream) {
       const content = chunk.choices[0]?.delta?.content || '';
       if (content) {
         fullContent += content;
         
-        const tokens = content.split(/(\s+)/);
-        
-        for (const token of tokens) {
-          if (token.includes('\n')) {
-            const parts = token.split('\n');
-            parts.forEach((part, idx) => {
-              if (idx === 0) {
-                currentLine += part;
-              } else {
-                process.stdout.write(C.agent('  ') + formatLine(currentLine) + '\n');
-                currentLine = part;
-              }
-            });
-          } else {
-            currentLine += token;
+        // Check for newlines to complete lines
+        if (content.includes('\n')) {
+          const parts = (currentLine + content).split('\n');
+          // All but the last part are complete lines
+          for (let i = 0; i < parts.length - 1; i++) {
+            const formatted = formatLine(parts[i]);
+            lines.push(parts[i]);
+            process.stdout.write(C.agent('  ') + formatted + '\n');
           }
+          // Last part is the new current line
+          currentLine = parts[parts.length - 1];
+        } else {
+          currentLine += content;
         }
         
         await new Promise(r => setTimeout(r, 4));
       }
     }
     
+    // Handle any remaining content
     if (currentLine) {
+      lines.push(currentLine);
       process.stdout.write(C.agent('  ') + formatLine(currentLine) + '\n');
     }
     
     cliCursor.show();
+    
+    // If content contains markdown tables, re-render with proper formatting
+    if (fullContent.includes('|')) {
+      // Clear previous output and re-render with markdown support
+      const lineCount = lines.length + 2; // +2 for header and newline
+      process.stdout.write('\x1b[' + lineCount + 'A'); // Move cursor up
+      process.stdout.write('\x1b[0J'); // Clear from cursor to end
+      
+      const rendered = renderMarkdown(fullContent);
+      process.stdout.write(C.agent(rendered));
+    }
+    
     return fullContent;
   }
 
