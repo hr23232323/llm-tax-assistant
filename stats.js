@@ -5,6 +5,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import chalk from 'chalk';
 import gradient from 'gradient-string';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,7 +19,7 @@ const C = {
 };
 
 const stats = async () => {
-  const kb = await fs.readFile(path.join(__dirname, 'tax-knowledge-base.txt'), 'utf-8');
+  const kb = await fs.readFile(path.join(__dirname, 'knowledge-base', 'tax-knowledge-base.txt'), 'utf-8');
   const lines = kb.split('\n');
   const words = kb.split(/\s+/);
   
@@ -44,7 +47,8 @@ const stats = async () => {
   console.log(`  ${C.dot} ${C.label('Lines:')}       ${lines.length.toLocaleString()}`);
   console.log(`  ${C.dot} ${C.label('Words:')}       ${words.length.toLocaleString()}`);
   console.log(`  ${C.dot} ${C.label('Pages:')}       ~142 pages`);
-  console.log(`  ${C.dot} ${C.label('Model:')}        Google Gemini 3 Flash Preview`);
+  const model = process.env.MODEL || 'google/gemini-3-flash-preview';
+  console.log(`  ${C.dot} ${C.label('Model:')}        ${model}`);
   console.log('');
   
   console.log(C.dim('  Topics: Filing requirements, Income, Deductions, Tax credits,'));

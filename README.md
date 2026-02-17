@@ -30,6 +30,15 @@ A lean, fast tax assistant powered by IRS Publication 17 (2025) and OpenRouter. 
 
 ## Setup
 
+### Quick Start (Makefile)
+
+```bash
+make setup    # Install deps + create .env file
+make start    # Start Tax GPT
+```
+
+### Manual Setup
+
 1. Install dependencies:
 ```bash
 npm install
@@ -40,12 +49,20 @@ npm install
 OPENROUTER_API_KEY=your_key_here
 ```
 
+3. (Optional) Change the AI model:
+```
+MODEL=google/gemini-3-flash-preview
+```
+
 Get your API key at: https://openrouter.ai/keys
+Browse available models at: https://openrouter.ai/models
 
 ## Usage
 
 ```bash
 npm start
+# or
+make start
 ```
 
 ## Session Storage
@@ -59,6 +76,8 @@ Each session is stored as a JSON file with full conversation history.
 ## Knowledge Base
 
 The application uses the complete text of **IRS Publication 17 (2025)**: "Your Federal Income Tax For Individuals"
+
+**Location:** `knowledge-base/tax-knowledge-base.txt`
 
 **Statistics:**
 - 995,462 characters
@@ -74,6 +93,14 @@ The application uses the complete text of **IRS Publication 17 (2025)**: "Your F
 - Estimated taxes and withholding
 - 2025 tax tables and rates
 
+### Contributing Knowledge
+
+Want to add more tax knowledge? Check out [`knowledge-base/README.md`](knowledge-base/README.md) for:
+- How to add new sources (IRS pubs, state guides, etc.)
+- Formatting guidelines
+- Code modification instructions
+- Legal considerations
+
 ## Model
 
 **Google Gemini 3 Flash Preview** via OpenRouter
@@ -84,6 +111,36 @@ The application uses the complete text of **IRS Publication 17 (2025)**: "Your F
 ## Disclaimer
 
 ⚠️ **This is informational only and not professional tax advice.** Always consult a qualified tax professional for your specific situation.
+
+## Contributing
+
+We welcome contributions! Here's how you can help:
+
+### Add More Knowledge
+
+The easiest way to contribute is by expanding the knowledge base:
+- Add IRS publications (Pub 501, 505, etc.)
+- Include state tax guides
+- Add tax court decisions
+
+See [`knowledge-base/README.md`](knowledge-base/README.md) for detailed instructions.
+
+### Code Contributions
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+### Ideas for Contributions
+
+- [ ] Multi-file knowledge base support
+- [ ] Search across multiple tax years
+- [ ] Export to PDF
+- [ ] Web interface
+- [ ] State-specific tax modules
+- [ ] Integration with tax software APIs
 
 ## License
 

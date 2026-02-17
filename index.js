@@ -25,7 +25,7 @@ const openai = new OpenAI({
   }
 });
 
-const MODEL = 'google/gemini-3-flash-preview';
+const MODEL = process.env.MODEL || 'google/gemini-3-flash-preview';
 const MAX_CONTEXT_CHARS = 120000;
 const MAX_HISTORY_TURNS = 10;
 const STREAM_DELAY = 8;
@@ -174,7 +174,7 @@ class TaxGPT {
     }).start();
     
     try {
-      const kbPath = path.join(__dirname, 'tax-knowledge-base.txt');
+      const kbPath = path.join(__dirname, 'knowledge-base', 'tax-knowledge-base.txt');
       this.knowledgeBase = await fs.readFile(kbPath, 'utf-8');
       this.chunks = this.createChunks(this.knowledgeBase, 3000);
       spinner.succeed(C.system(`Loaded ${this.chunks.length.toLocaleString()} chunks`));
