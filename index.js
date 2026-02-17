@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
+import readline from 'readline';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import chalk from 'chalk';
@@ -222,21 +223,44 @@ class TaxGPT {
       .map(item => item.chunk);
   }
 
-  buildSystemPrompt(context, history) {
-    return `You are Tax GPT, a tax assistant using IRS Publication 17 (2025).
+  buildSystemPrompt(context, history, isFirstMessage = false) {
+    const basePrompt = `You are Tax GPT, a tax savings assistant powered by IRS Publication 17 (2025).
+
+YOUR MISSION:
+Help users legally minimize their tax liability and keep more of their money. Every interaction should move toward identifying deductions, credits, and strategies they might be missing.
+
+CORE PRINCIPLES:
+1. TAX SAVINGS FIRST - Always look for opportunities to reduce taxable income or increase credits
+2. PROACTIVE GUIDANCE - Don't just answer questions; suggest related savings opportunities
+3. SPECIFICITY WINS - Give exact dollar amounts, income thresholds, and form numbers
+4. CLARIFY TO SAVE - Ask about their situation to find credits/deductions they qualify for
+
+APPROACH:
+- Frame answers around "Here's how this affects your bottom line..."
+- After answering, suggest 1-2 related tax savings opportunities
+- Ask: "Do you also [qualify for X / have Y situation]?" to uncover more savings
+- Always mention: "Many people miss this deduction..." when relevant
 
 RULES:
 - Answer using ONLY the IRS Publication 17 context provided
-- Be concise. Prefer one sentence over two
-- Use bullet points for lists
-- Cite specific tables, sections, or page numbers
-- Ask clarifying questions when tax situation is unclear
+- Be conversational and enthusiastic about finding savings
+- Use bullet points for deductions/credits lists
+- Cite specific sections, tables, and dollar thresholds
 - Format: $X,XXX for money, percentages as X%
+- Never suggest illegal tax evasion - only legal avoidance strategies
 
-IRS PUBLICATION 17 (2025) CONTEXT:
+${isFirstMessage ? `OPENING GREETING (use this exactly or adapt slightly):
+"Welcome to Tax GPT! 💰\n\nI'm here to help you pay less in taxes and keep more of your hard-earned money. Whether you're filing for the first time or looking for deductions you might have missed, I'll search through IRS Publication 17 to find every legal way to reduce your tax bill.\n\nQuick questions to get you thinking about savings:\n• What's the standard deduction for 2025 and should I itemize instead?
+• Am I missing any tax credits I qualify for?
+• How can I reduce my taxable income before the deadline?
+• What's the best filing status for my situation?
+\nWhat would you like to explore? I'm ready to help you save!"
+
+` : ''}IRS PUBLICATION 17 (2025) CONTEXT:
 ${context}
 
 ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
+    return basePrompt;
   }
 
   async askQuestion(question) {
@@ -250,11 +274,13 @@ ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
     const historyContext = recentHistory.length > 0 
       ? recentHistory.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.substring(0, 100)}${m.content.length > 100 ? '...' : ''}`).join('\n')
       : '';
+    
+    const isFirstMessage = recentHistory.length === 0;
 
     const messages = [
       {
         role: 'system',
-        content: this.buildSystemPrompt(truncatedContext, historyContext)
+        content: this.buildSystemPrompt(truncatedContext, historyContext, isFirstMessage)
       },
       ...recentHistory.map(m => ({ role: m.role, content: m.content })),
       { role: 'user', content: question }
@@ -404,7 +430,7 @@ ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
         process.exit(0);
 
       case '/new':
-        const { sessionName } = await inquirer.prompt([{
+        const { sessionName } = await this.safePrompt([{
           type: 'input',
           name: 'sessionName',
           message: C.system('Session name (optional):'),
@@ -443,7 +469,7 @@ ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
           return true;
         }
         
-        const { selected } = await inquirer.prompt([{
+        const { selected } = await this.safePrompt([{
           type: 'list',
           name: 'selected',
           message: C.system('Select session:'),
@@ -510,7 +536,7 @@ ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
           return true;
         }
         
-        const { toDelete } = await inquirer.prompt([{
+        const { toDelete } = await this.safePrompt([{
           type: 'list',
           name: 'toDelete',
           message: C.system('Delete session:'),
@@ -533,6 +559,23 @@ ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
     }
   }
 
+  async safePrompt(questions) {
+    try {
+      return await this.safePrompt(questions);
+    } catch (error) {
+      if (error.name === 'ExitPromptError') {
+        // User pressed Ctrl+C - exit gracefully
+        console.log('');
+        console.log(C.system('  Saving session and exiting...'));
+        await this.sessionManager.saveSession();
+        console.log(C.highlight('  ✓ Goodbye!'));
+        console.log('');
+        process.exit(0);
+      }
+      throw error;
+    }
+  }
+
   async interactiveMode() {
     this.printWelcome();
     await this.sessionManager.init();
@@ -544,15 +587,181 @@ ${history ? `RECENT CONVERSATION:\n${history}` : ''}`;
     this.printSystem(`Session: ${this.sessionManager.currentSession.name}`);
     console.log('');
 
+    // Auto-trigger welcome greeting on first load if no messages yet
+    const isNewSession = this.sessionManager.currentSession.messages.length === 0;
+    if (isNewSession) {
+      const spinner = ora({
+        text: C.dim('Preparing your tax savings guide...'),
+        spinner: 'dots',
+        color: 'gray'
+      }).start();
+
+      try {
+        const stream = await this.askQuestion('Introduce yourself and suggest some tax savings questions I could ask');
+        spinner.stop();
+        
+        // Stream welcome response
+        cliCursor.hide();
+        process.stdout.write('\n' + C.agentLabel('  ' + ICONS.agent + ' Tax GPT') + '\n');
+        
+        let fullContent = '';
+        let currentLine = '';
+        
+        for await (const chunk of stream) {
+          const content = chunk.choices[0]?.delta?.content || '';
+          if (content) {
+            fullContent += content;
+            
+            const tokens = content.split(/(\s+)/);
+            
+            for (const token of tokens) {
+              if (token.includes('\n')) {
+                const parts = token.split('\n');
+                parts.forEach((part, idx) => {
+                  if (idx === 0) {
+                    currentLine += part;
+                  } else {
+                    process.stdout.write(C.agent('  ') + formatLine(currentLine) + '\n');
+                    currentLine = part;
+                  }
+                });
+              } else {
+                currentLine += token;
+              }
+            }
+            
+            await new Promise(r => setTimeout(r, 4));
+          }
+        }
+        
+        if (currentLine) {
+          process.stdout.write(C.agent('  ') + formatLine(currentLine) + '\n');
+        }
+        
+        cliCursor.show();
+        this.sessionManager.addMessage('assistant', fullContent);
+        
+        console.log('');
+      } catch (error) {
+        spinner.stop();
+        this.printError('Failed to load welcome message: ' + error.message);
+      }
+      
+      // Show starter questions as selectable list
+      const exampleQuestions = [
+        { name: "1. What's the standard deduction for 2025 and should I itemize instead?", value: "What's the standard deduction for 2025 and should I itemize instead?" },
+        { name: "2. Am I missing any tax credits I qualify for?", value: "Am I missing any tax credits I qualify for?" },
+        { name: "3. How can I reduce my taxable income before the deadline?", value: "How can I reduce my taxable income before the deadline?" },
+        { name: "4. What's the best filing status for my situation?", value: "What's the best filing status for my situation?" },
+        { name: "5. ✏️  OR type whatever you want!", value: "__CUSTOM__" }
+      ];
+      
+      console.log(C.dim('  ─────────────────────────────────────────'));
+      console.log(C.dim('  Select a number or type any question:'));
+      const { selectedQuestion } = await this.safePrompt([{
+        type: 'list',
+        name: 'selectedQuestion',
+        message: C.system('Get started:'),
+        choices: exampleQuestions,
+        pageSize: 10
+      }]);
+      
+      let input;
+      if (selectedQuestion === '__CUSTOM__') {
+        const { customInput } = await this.safePrompt([{
+          type: 'input',
+          name: 'customInput',
+          message: '',
+          prefix: C.user('  ' + ICONS.user + ' ')
+        }]);
+        input = customInput;
+      } else {
+        input = selectedQuestion;
+        // Show the selected question as user input
+        console.log(C.user('  ' + ICONS.user + ' ' + input));
+      }
+      
+      if (!input.trim()) {
+        // Fall through to normal loop if nothing selected
+      } else {
+        console.log('');
+        
+        const spinner2 = ora({
+          text: C.dim('Searching for tax savings...'),
+          spinner: 'dots',
+          color: 'gray'
+        }).start();
+
+        try {
+          this.sessionManager.addMessage('user', input);
+          
+          spinner2.text = C.dim('Analyzing your situation...');
+          const stream = await this.askQuestion(input);
+          
+          spinner2.stop();
+          
+          // Stream response with color highlighting
+          cliCursor.hide();
+          process.stdout.write('\n' + C.agentLabel('  ' + ICONS.agent + ' Tax GPT') + '\n');
+          
+          let fullContent = '';
+          let currentLine = '';
+          
+          for await (const chunk of stream) {
+            const content = chunk.choices[0]?.delta?.content || '';
+            if (content) {
+              fullContent += content;
+              
+              const tokens = content.split(/(\s+)/);
+              
+              for (const token of tokens) {
+                if (token.includes('\n')) {
+                  const parts = token.split('\n');
+                  parts.forEach((part, idx) => {
+                    if (idx === 0) {
+                      currentLine += part;
+                    } else {
+                      process.stdout.write(C.agent('  ') + formatLine(currentLine) + '\n');
+                      currentLine = part;
+                    }
+                  });
+                } else {
+                  currentLine += token;
+                }
+              }
+              
+              await new Promise(r => setTimeout(r, 4));
+            }
+          }
+          
+          if (currentLine) {
+            process.stdout.write(C.agent('  ') + formatLine(currentLine) + '\n');
+          }
+          
+          cliCursor.show();
+          this.sessionManager.addMessage('assistant', fullContent);
+          
+          console.log('');
+          console.log(C.dim('  ' + ICONS.dot + ' ' + chalk.italic('Not professional tax advice')));
+          console.log('');
+        } catch (error) {
+          spinner2.stop();
+          this.printError(error.message);
+        }
+      }
+    }
+
     while (true) {
       this.printInputBox();
       
-      const { input } = await inquirer.prompt([{
+      const { input: loopInput } = await this.safePrompt([{
         type: 'input',
         name: 'input',
         message: '',
         prefix: C.user('  ' + ICONS.user + ' ')
       }]);
+      
+      input = loopInput;
 
       if (!input.trim()) continue;
 
@@ -646,8 +855,98 @@ async function main() {
   }
 
   const taxGPT = new TaxGPT();
-  await taxGPT.loadKnowledgeBase();
-  await taxGPT.interactiveMode();
+  
+  // Handle graceful shutdown
+  let shutdownInProgress = false;
+  
+  const gracefulShutdown = async (signal) => {
+    if (shutdownInProgress) {
+      console.log('');
+      console.log(C.error('  Forced exit'));
+      process.exit(1);
+    }
+    
+    shutdownInProgress = true;
+    console.log('');
+    console.log(C.system('  Saving session and exiting...'));
+    
+    try {
+      await taxGPT.sessionManager.saveSession();
+    } catch (e) {
+      // Ignore save errors during shutdown
+    }
+    
+    console.log(C.highlight('  ✓ Goodbye!'));
+    console.log('');
+    process.exit(0);
+  };
+  
+  // Handle Ctrl+C (SIGINT) - always works
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  
+  // Handle other termination signals
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  
+  // Handle Escape key detection for double-press exit
+  let escapeCount = 0;
+  let escapeTimer = null;
+  
+  const handleKeypress = (str, key) => {
+    if (key && key.name === 'escape') {
+      escapeCount++;
+      
+      if (escapeCount === 1) {
+        console.log('');
+        console.log(C.dim('  Press ESC again to quit (or use Ctrl+C)'));
+        escapeTimer = setTimeout(() => {
+          escapeCount = 0;
+        }, 2000);
+      } else if (escapeCount >= 2) {
+        clearTimeout(escapeTimer);
+        escapeTimer = null;
+        escapeCount = 0;
+        gracefulShutdown('ESC');
+      }
+    } else if (key && (key.name === 'c' && key.ctrl)) {
+      // Ctrl+C is handled by SIGINT above, but this ensures it works during prompts too
+      gracefulShutdown('SIGINT');
+    } else {
+      escapeCount = 0;
+      if (escapeTimer) {
+        clearTimeout(escapeTimer);
+        escapeTimer = null;
+      }
+    }
+  };
+  
+  // Set up keypress handling
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    readline.emitKeypressEvents(process.stdin);
+    process.stdin.on('keypress', handleKeypress);
+  }
+  
+  try {
+    await taxGPT.loadKnowledgeBase();
+    await taxGPT.interactiveMode();
+  } catch (error) {
+    if (error.name === 'ExitPromptError') {
+      // User pressed Ctrl+C during a prompt
+      await gracefulShutdown('SIGINT');
+    } else {
+      throw error;
+    }
+  }
 }
 
-main().catch(console.error);
+main().catch(async (error) => {
+  if (error.name === 'ExitPromptError') {
+    // Graceful exit on Ctrl+C during prompt
+    console.log('');
+    console.log(C.system('  Goodbye!'));
+    console.log('');
+    process.exit(0);
+  }
+  console.error(error);
+  process.exit(1);
+});
