@@ -7,6 +7,14 @@
   "bin": {
     "tax-gpt": "./index.js"
   },
+  "exports": {
+    ".": "./index.js",
+    "./config": "./src/config.js",
+    "./formatter": "./src/formatter.js",
+    "./session": "./src/session.js",
+    "./commands": "./src/commands.js",
+    "./ai": "./src/ai.js"
+  },
   "scripts": {
     "start": "node index.js"
   },
